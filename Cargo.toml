@@ -1,0 +1,18 @@
+[package]
+name = "beer_mouse_clicker"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+egui_extras = { version = "0.31", features = ["all_loaders"] }
+winapi = { version = "0.3", features = ["winuser", "winbase", "synchapi", "libloaderapi", "errhandlingapi", "processthreadsapi", "shellapi", "winerror", "winnls"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+image = "0.25"
+rfd = "0.15"
+rand = "0.8"
+regex = "1"
+winreg = "0.52"
+
+
