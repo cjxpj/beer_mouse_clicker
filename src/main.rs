@@ -16,6 +16,12 @@ use std::ptr::null_mut;
 use winapi::um::winuser::{MessageBoxW, MB_OK, MB_ICONERROR};
 
 fn main() {
+    // 若启用“以管理员运行”且当前未提权，则提权重启
+    if config::load_run_as_admin() && !state::is_elevated() {
+        state::relaunch_elevated();
+        return;
+    }
+
     let icon_data = load_icon();
 
     let mut viewport = egui::ViewportBuilder::default()

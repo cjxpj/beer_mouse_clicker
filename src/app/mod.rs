@@ -70,6 +70,10 @@ pub struct BeerClickerApp {
     first_frame: bool,
     background: bool,
     show_about: bool,
+    /// 是否启用“以管理员运行”
+    run_as_admin: bool,
+    /// 本轮结束后提权重启的标志
+    pending_elevate: bool,
     swap_offsets: Vec<(usize, f32)>,
     delete_animations: Vec<(usize, f32)>, // (任务索引, 进度 0→1)
     /// 识图缩略图缓存 image_id → PNG 字节数据
@@ -94,6 +98,9 @@ pub struct BeerClickerApp {
     rec_prev_keys: [u8; 256],
     /// 每个按键的按下时刻（用于长按判定）
     rec_key_down: [Option<Instant>; 256],
+    /// 热键录制时，鼠标键的“已就绪”标志：先等所有鼠标键松开，再接受下一次按下，
+    /// 避免把触发录制的这一次点击误录为热键
+    hotkey_mouse_armed: bool,
 }
 
 impl BeerClickerApp {
@@ -118,6 +125,8 @@ impl BeerClickerApp {
             first_frame: true,
             background: crate::config::load_background(),
             show_about: false,
+            run_as_admin: crate::config::load_run_as_admin(),
+            pending_elevate: false,
             swap_offsets: Vec::new(),
             delete_animations: Vec::new(),
             thumbnail_cache: std::collections::HashMap::new(),
@@ -146,40 +155,33 @@ impl BeerClickerApp {
             rec_last_pos: (0, 0),
             rec_prev_keys: [0u8; 256],
             rec_key_down: [None; 256],
+            hotkey_mouse_armed: false,
         }
     }
 
-    fn poll_hotkey(&mut self, ctx: &egui::Context) {
-        if self.state.hotkey_recording {
-            return;
-        }
-        if !is_mouse_vk(self.state.hotkey) {
-            let key_down = unsafe { (GetAsyncKeyState(self.state.hotkey) & 0x8000u16 as i16) != 0 };
-            if key_down && !self.state.last_f6 {
-                // 待命中按热键：开始录制
-                if self.rec_armed {
-                    self.rec_armed = false;
-                    self.start_recording();
-                    self.state.last_f6 = key_down;
-                    return;
-                }
+    /// 消费后台热键监视线程的请求（启动/停止已由后台线程直接完成）
+    fn poll_hotkey(&mut self) {
+        if crate::state::take_hotkey_request() {
+            // 待命中按热键：开始录制
+            if self.rec_armed {
+                self.rec_armed = false;
+                self.start_recording();
+            } else if self.recording {
                 // 录制中按热键：停止录制
-                if self.recording {
-                    self.stop_recording();
-                    self.state.last_f6 = key_down;
-                    return;
-                }
-                // 后台模式：热键先唤出窗口，再切换
-                if self.background {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                }
-                self.state.toggle();
-                if self.state.clicking.load(Ordering::SeqCst) && self.recording {
-                    self.stop_recording();
-                }
+                self.stop_recording();
             }
-            self.state.last_f6 = key_down;
         }
+        // 后台线程已直接停止执行，此处只需结束可能进行中的录制
+        if crate::state::take_stop_record_request() && self.recording {
+            self.stop_recording();
+        }
+    }
+
+    /// 是否任意鼠标键处于按下状态
+    fn any_mouse_button_down() -> bool {
+        mouse_vks().iter().any(|&vk| unsafe {
+            (GetAsyncKeyState(vk) & 0x8000u16 as i16) != 0
+        })
     }
 
     fn update_locks(&mut self) {
@@ -658,12 +660,13 @@ impl BeerClickerApp {
 
             ui.label(egui::RichText::new(t(self.lang, "热键", "Hotkey")).size(12.0).color(C_SUBTEXT));
             let hotkey_text = if self.state.hotkey_recording {
-                t(self.lang, "按下按键...", "Press a key...").to_owned()
+                t(self.lang, "按下按键或鼠标键…", "Press a key or mouse button…").to_owned()
             } else {
                 vk_name(self.state.hotkey, self.lang)
             };
             if ui.button(&hotkey_text).clicked() {
                 self.state.hotkey_recording = true;
+                self.hotkey_mouse_armed = false;
             }
 
             let (rec_text, rec_color) = if self.recording {
@@ -705,6 +708,30 @@ impl BeerClickerApp {
             if ui.checkbox(&mut lock_mouse, t(self.lang, "锁鼠", "Lock Mouse")).changed() {
                 self.state.lock_mouse = lock_mouse;
                 crate::config::save_lock_mouse(lock_mouse);
+            }
+            let mut emergency_stop = self.state.emergency_stop;
+            if ui.checkbox(&mut emergency_stop, t(self.lang, "紧急停止(ESC)", "Emergency Stop (ESC)"))
+                .on_hover_text(t(self.lang,
+                    "按 ESC 立即停止连点/录制",
+                    "Press ESC to stop clicking/recording immediately"))
+                .changed()
+            {
+                self.state.emergency_stop = emergency_stop;
+                crate::config::save_emergency_stop(emergency_stop);
+                crate::state::set_global_emergency(emergency_stop);
+            }
+            let mut run_admin = self.run_as_admin;
+            if ui.checkbox(&mut run_admin, t(self.lang, "以管理员运行", "Run as Admin"))
+                .on_hover_text(t(self.lang,
+                    "提权运行（弹 UAC），解决提权游戏的热键/点击被拦截问题",
+                    "Run elevated (UAC). Fixes hotkey/injection blocked in elevated games"))
+                .changed()
+            {
+                self.run_as_admin = run_admin;
+                crate::config::save_run_as_admin(run_admin);
+                if run_admin && !crate::state::is_elevated() {
+                    self.pending_elevate = true;
+                }
             }
             let mut auto_exec = self.state.auto_exec;
             if ui.checkbox(&mut auto_exec, t(self.lang, "启动执行", "Exec on Launch"))
@@ -883,10 +910,13 @@ impl eframe::App for BeerClickerApp {
         }
 
         self.process_hotkey_recording(ctx);
-        if !self.state.hotkey_recording {
-            self.poll_hotkey(ctx);
-        }
+        crate::state::set_watcher_paused(self.state.hotkey_recording);
+        crate::state::set_ui_recording(self.recording);
+        crate::state::set_ui_rec_armed(self.rec_armed);
+        crate::state::set_ui_background(self.background);
+        self.poll_hotkey();
         self.tick_tip();
+        self.check_inject_failure();
         self.process_recorded_events();
         self.update_locks();
 
@@ -954,6 +984,13 @@ impl eframe::App for BeerClickerApp {
         self.draw_add_popup(ctx);
         self.draw_about_popup(ctx);
 
+        // 启用“以管理员运行”后：提权重启并退出当前进程
+        if self.pending_elevate {
+            self.pending_elevate = false;
+            crate::state::relaunch_elevated();
+            std::process::exit(0);
+        }
+
         // 实时坐标显示
         if self.show_coords {
             let mut pt: winapi::shared::windef::POINT = unsafe { std::mem::zeroed() };
@@ -1000,17 +1037,37 @@ impl BeerClickerApp {
             if ctx.input(|i| i.key_pressed(key)) {
                 let vk = egui_key_to_vk(key);
                 if vk != 0 {
-                    self.state.hotkey = vk;
-                    self.state.hotkey_recording = false;
-                    self.state.last_f6 = true;
-                    crate::config::save_hotkey(self.state.hotkey);
-                    if is_mouse_vk(self.state.hotkey) {
-                        self.state.tip_text = t(self.lang, "提示：鼠标热键在窗口外点击才生效", "Tip: click outside the window to trigger mouse hotkey").into();
-                        self.state.tip_ticks = 90;
-                    }
+                    self.set_hotkey(vk);
                     return;
                 }
             }
+        }
+        // 鼠标按键（左/右/中/侧键1/侧键2）：先等所有鼠标键松开，再接受下一次按下，
+        // 避免把触发录制的这一次点击误录为热键
+        if !self.hotkey_mouse_armed {
+            if !Self::any_mouse_button_down() {
+                self.hotkey_mouse_armed = true;
+            }
+            return;
+        }
+        for vk in mouse_vks() {
+            if unsafe { (GetAsyncKeyState(vk) & 0x8000u16 as i16) != 0 } {
+                self.set_hotkey(vk);
+                return;
+            }
+        }
+    }
+
+    /// 设置热键并结束录制
+    fn set_hotkey(&mut self, vk: i32) {
+        self.state.hotkey = vk;
+        self.state.hotkey_recording = false;
+        self.hotkey_mouse_armed = false;
+        crate::state::set_global_hotkey(vk);
+        crate::config::save_hotkey(vk);
+        if is_mouse_vk(vk) {
+            self.state.tip_text = t(self.lang, "提示：鼠标热键可全局触发（含本程序窗口内）", "Tip: mouse hotkey works globally, including over this window").into();
+            self.state.tip_ticks = 90;
         }
     }
 
@@ -1020,6 +1077,16 @@ impl BeerClickerApp {
             if self.state.tip_ticks == 0 {
                 self.state.tip_text.clear();
             }
+        }
+    }
+
+    /// 执行线程检测到鼠标注入失败时给出提示（常见于目标窗口以管理员/高权限运行）
+    fn check_inject_failure(&mut self) {
+        if self.state.inject_failed.swap(false, Ordering::SeqCst) {
+            self.state.tip_text = t(self.lang,
+                "鼠标注入失败：目标窗口可能以管理员运行，请尝试以管理员身份运行本程序",
+                "Mouse injection failed: target may run elevated. Try running this app as administrator.").into();
+            self.state.tip_ticks = 240;
         }
     }
 }

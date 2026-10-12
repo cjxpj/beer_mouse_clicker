@@ -168,6 +168,14 @@ pub fn is_mouse_vk(vk: i32) -> bool {
         || vk == VK_XBUTTON1 || vk == VK_XBUTTON2
 }
 
+/// 全部鼠标按键的虚拟键码：左 / 右 / 中 / 侧键1 / 侧键2
+pub fn mouse_vks() -> [i32; 5] {
+    use winapi::um::winuser::{
+        VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2,
+    };
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+}
+
 // ── 任务步骤描述 ──────────────────────────────────────────
 
 pub fn task_desc_egui(step: &TaskStep, lang: Lang) -> String {
@@ -302,6 +310,9 @@ pub fn task_desc_egui(step: &TaskStep, lang: Lang) -> String {
             }
             if (step.extra & 0x200) != 0 {
                 desc.push_str(t(lang, " 忽略失败", " ignore fail"));
+            }
+            if (step.extra & 0x10000) != 0 {
+                desc.push_str(t(lang, " 循环重试", " retry"));
             }
             desc
         }

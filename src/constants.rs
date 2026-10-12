@@ -2,6 +2,12 @@
 pub const WND_W: i32 = 760;
 pub const WND_H: i32 = 480;
 
+// ── 鼠标点击默认最短按下时长（毫秒）─────────────────────────
+/// hold_ms 为 0 时的实际按下时长。过短会被逐帧轮询的游戏漏掉，故提高默认值。
+pub const CLICK_MIN_HOLD_MS: u32 = 30;
+/// 键盘按键 hold_ms 为 0 时的实际按下时长（同理，避免游戏逐帧轮询漏掉）
+pub const KEY_MIN_HOLD_MS: u32 = 30;
+
 // ── 任务模式操作类型 ─────────────────────────────────────────
 #[derive(Clone, Copy, PartialEq)]
 pub enum TaskActionType {

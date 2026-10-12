@@ -1,7 +1,20 @@
 use crate::constants::{TaskActionType, TaskStep};
 use rusqlite::Connection;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+// ── 执行参数快照（供后台热键线程在不依赖 UI 的情况下启动任务）──
+static TASKS_SNAPSHOT: Mutex<Vec<TaskStep>> = Mutex::new(Vec::new());
+static INTERVAL_MS: AtomicU64 = AtomicU64::new(1000);
+static TASK_LOOP: AtomicBool = AtomicBool::new(true);
+
+/// 获取任务列表快照
+pub fn tasks_snapshot() -> Vec<TaskStep> { TASKS_SNAPSHOT.lock().unwrap().clone() }
+/// 获取任务间隔（毫秒）
+pub fn interval_ms() -> u64 { INTERVAL_MS.load(Ordering::SeqCst) }
+/// 是否循环执行任务
+pub fn task_loop_enabled() -> bool { TASK_LOOP.load(Ordering::SeqCst) }
 
 fn db_path() -> PathBuf {
     match std::env::current_exe() {
@@ -36,7 +49,7 @@ fn db() -> &'static Mutex<Connection> {
 
 /// 从数据库加载所有配置，未找到则返回默认值
 #[allow(clippy::type_complexity)]
-pub fn load_all() -> (u64, i32, bool, bool, Vec<TaskStep>, bool, bool, bool, bool, bool, bool) {
+pub fn load_all() -> (u64, i32, bool, bool, Vec<TaskStep>, bool, bool, bool, bool, bool, bool, bool) {
     let conn = db().lock().unwrap();
     let interval = get_u64(&conn, "interval_ms", 1000);
     let hotkey = get_i32(&conn, "hotkey", 0x75);
@@ -49,14 +62,19 @@ pub fn load_all() -> (u64, i32, bool, bool, Vec<TaskStep>, bool, bool, bool, boo
     let autostart = get_str(&conn, "autostart", "0") == "1";
     let auto_exec = get_str(&conn, "auto_exec", "0") == "1";
     let auto_exec_boot = get_str(&conn, "auto_exec_boot", "0") == "1";
-    (interval, hotkey, lock_kb, lock_mouse, tasks, task_loop, background, rec_compress, autostart, auto_exec, auto_exec_boot)
+    let emergency_stop = get_str(&conn, "emergency_stop", "1") == "1";
+    // 初始化执行参数快照，供后台线程使用
+    INTERVAL_MS.store(interval, Ordering::SeqCst);
+    TASK_LOOP.store(task_loop, Ordering::SeqCst);
+    *TASKS_SNAPSHOT.lock().unwrap() = tasks.clone();
+    (interval, hotkey, lock_kb, lock_mouse, tasks, task_loop, background, rec_compress, autostart, auto_exec, auto_exec_boot, emergency_stop)
 }
 
-pub fn save_interval(ms: u64) { set("interval_ms", &ms.to_string()); }
+pub fn save_interval(ms: u64) { INTERVAL_MS.store(ms, Ordering::SeqCst); set("interval_ms", &ms.to_string()); }
 pub fn save_hotkey(vk: i32) { set("hotkey", &vk.to_string()); }
 pub fn save_lock_kb(on: bool) { set("lock_kb", if on { "1" } else { "0" }); }
 pub fn save_lock_mouse(on: bool) { set("lock_mouse", if on { "1" } else { "0" }); }
-pub fn save_task_loop(on: bool) { set("task_loop", if on { "1" } else { "0" }); }
+pub fn save_task_loop(on: bool) { TASK_LOOP.store(on, Ordering::SeqCst); set("task_loop", if on { "1" } else { "0" }); }
 pub fn save_background(on: bool) { set("background", if on { "1" } else { "0" }); }
 pub fn save_rec_compress(on: bool) { set("rec_compress", if on { "1" } else { "0" }); }
 pub fn load_background() -> bool { let conn = db().lock().unwrap(); get_str(&conn, "background", "0") == "1" }
@@ -64,11 +82,15 @@ pub fn load_rec_compress() -> bool { let conn = db().lock().unwrap(); get_str(&c
 pub fn save_autostart(on: bool) { set("autostart", if on { "1" } else { "0" }); }
 pub fn save_auto_exec(on: bool) { set("auto_exec", if on { "1" } else { "0" }); }
 pub fn save_auto_exec_boot(on: bool) { set("auto_exec_boot", if on { "1" } else { "0" }); }
+pub fn save_emergency_stop(on: bool) { set("emergency_stop", if on { "1" } else { "0" }); }
+pub fn load_run_as_admin() -> bool { let conn = db().lock().unwrap(); get_str(&conn, "run_as_admin", "0") == "1" }
+pub fn save_run_as_admin(on: bool) { set("run_as_admin", if on { "1" } else { "0" }); }
 pub fn save_lang(lang: &str) { set("language", lang); }
 pub fn load_lang() -> String { let conn = db().lock().unwrap(); get_str(&conn, "language", "") }
 
 /// 保存任务列表（格式: type:param:extra;type:param:extra;...）
 pub fn save_tasks(tasks: &[TaskStep]) {
+    *TASKS_SNAPSHOT.lock().unwrap() = tasks.to_vec();
     let s: String = tasks.iter()
         .map(|t| format!("{}:{}:{}", t.action as u8, t.param, t.extra))
         .collect::<Vec<_>>()

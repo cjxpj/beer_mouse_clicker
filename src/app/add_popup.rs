@@ -17,7 +17,7 @@ pub enum AddState {
     ConfigKey { vk: i32, hold_ms: u64, hold_str: String, recording: bool, action_type: TaskActionType },
     ConfigWheel { up: bool },
     ConfigMove { preset: usize, secs_str: String, custom_x: String, custom_y: String, window_title: String, is_relative: bool },
-    ConfigImageMatch { path: String, confidence_str: String, fail_msg: String, move_mouse: bool, ignore_failure: bool, window_title: String, thumbnail: Option<Vec<u8>>, full_image: Option<Vec<u8>>, show_preview: bool, preview_w: u32, preview_h: u32 },
+    ConfigImageMatch { path: String, confidence_str: String, fail_msg: String, move_mouse: bool, ignore_failure: bool, retry_until_match: bool, window_title: String, thumbnail: Option<Vec<u8>>, full_image: Option<Vec<u8>>, show_preview: bool, preview_w: u32, preview_h: u32 },
     ConfigNotify { msg: String },
     ConfigRandomDelay { min_str: String, max_str: String },
     ConfigComboKey { preset: usize },
@@ -146,7 +146,7 @@ impl BeerClickerApp {
                             else if s == t(self.lang, "松开按键", "Key Up") { self.add_state = AddState::ConfigKey { vk: 0x20, hold_ms: 0, hold_str: "0".into(), recording: false, action_type: TaskActionType::KeyUp }; }
                             else if s == t(self.lang, "滚轮", "Wheel") { self.add_state = AddState::ConfigWheel { up: true }; }
                             else if s == t(self.lang, "移动", "Move") { self.add_state = AddState::ConfigMove { preset: 0, secs_str: "0.0".into(), custom_x: String::new(), custom_y: String::new(), window_title: String::new(), is_relative: false }; }
-                            else if s == t(self.lang, "识图", "Image Match") { self.add_state = AddState::ConfigImageMatch { path: String::new(), confidence_str: "85".into(), fail_msg: String::new(), move_mouse: true, ignore_failure: false, window_title: String::new(), thumbnail: None, full_image: None, show_preview: false, preview_w: 0, preview_h: 0 }; }
+                            else if s == t(self.lang, "识图", "Image Match") { self.add_state = AddState::ConfigImageMatch { path: String::new(), confidence_str: "85".into(), fail_msg: String::new(), move_mouse: true, ignore_failure: false, retry_until_match: false, window_title: String::new(), thumbnail: None, full_image: None, show_preview: false, preview_w: 0, preview_h: 0 }; }
                             else if s == t(self.lang, "通知", "Notify") { self.add_state = AddState::ConfigNotify { msg: String::new() }; }
                             else if s == t(self.lang, "复制文本", "Copy Text") { self.add_state = AddState::ConfigCopyText { msg: String::new() }; }
                             else if s == t(self.lang, "备注", "Comment") { self.add_state = AddState::ConfigComment { msg: String::new(), count_str: String::new() }; }
@@ -536,7 +536,7 @@ impl BeerClickerApp {
                             crate::config::save_tasks(&self.state.tasks);
                         }
                     }
-                    AddState::ConfigImageMatch { path, confidence_str, fail_msg, move_mouse, ignore_failure, window_title, thumbnail, full_image, show_preview, preview_w, preview_h } => {
+                    AddState::ConfigImageMatch { path, confidence_str, fail_msg, move_mouse, ignore_failure, retry_until_match, window_title, thumbnail, full_image, show_preview, preview_w, preview_h } => {
                         if let Some(p) = self.picked_path.take() {
                             *path = p.clone();
                             *full_image = std::fs::read(&p).ok();
@@ -631,12 +631,15 @@ impl BeerClickerApp {
                         });
                         ui.add_space(4.0);
                         ui.checkbox(ignore_failure, t(self.lang, "无视失败继续执行", "Ignore failure"));
+                        ui.add_space(4.0);
+                        ui.checkbox(retry_until_match, t(self.lang, "循环重试直到成功", "Retry until matched"));
                         ui.add_space(8.0);
                         let img_path = path.clone();
                         let conf_threshold = confidence_str.parse::<u8>().unwrap_or(85).clamp(1, 100);
                         let fail_text = fail_msg.clone();
                         let do_move = *move_mouse;
                         let do_ignore = *ignore_failure;
+                        let do_retry = *retry_until_match;
                         let win_title = window_title.clone();
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button(t(self.lang, "取消", "Cancel")).clicked() { close = true; }
@@ -658,6 +661,7 @@ impl BeerClickerApp {
                                     let extra = conf_threshold as u32
                                         | (if do_move { 0x100 } else { 0 })
                                         | (if do_ignore { 0x200 } else { 0 })
+                                        | (if do_retry { 0x10000 } else { 0 })
                                         | (window_id << 10);
                                     self.state.tasks.push(TaskStep {
                                         action: TaskActionType::ImageMatch,

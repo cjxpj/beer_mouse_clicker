@@ -15,7 +15,7 @@ pub enum EditState {
     Key { vk: i32, hold_ms: u64, hold_str: String, recording: bool, action_type: TaskActionType },
     Wheel { up: bool },
     Move { preset: usize, secs_str: String, custom_x: String, custom_y: String, window_title: String, is_relative: bool },
-    ImageMatch { image_id: u32, new_path: String, new_thumbnail: Option<Vec<u8>>, full_image: Option<Vec<u8>>, show_preview: bool, preview_w: u32, preview_h: u32, confidence_str: String, fail_msg: String, move_mouse: bool, ignore_failure: bool, window_title: String },
+    ImageMatch { image_id: u32, new_path: String, new_thumbnail: Option<Vec<u8>>, full_image: Option<Vec<u8>>, show_preview: bool, preview_w: u32, preview_h: u32, confidence_str: String, fail_msg: String, move_mouse: bool, ignore_failure: bool, retry_until_match: bool, window_title: String },
     Notify { msg: String },
     LostFocus,
     RandomDelay { min_str: String, max_str: String },
@@ -76,6 +76,7 @@ impl BeerClickerApp {
                 };
                 let move_mouse = (step.extra & 0x100) != 0;
                 let ignore_failure = (step.extra & 0x200) != 0;
+                let retry_until_match = (step.extra & 0x10000) != 0;
                 let full_image = crate::config::load_image(image_id as u64);
                 let window_title_id = step.extra >> 10;
                 let window_title = if window_title_id != 0 {
@@ -95,6 +96,7 @@ impl BeerClickerApp {
                     fail_msg,
                     move_mouse,
                     ignore_failure,
+                    retry_until_match,
                     window_title,
                 }
             }
@@ -476,7 +478,7 @@ impl BeerClickerApp {
                             }
                         });
                     }
-                    EditState::ImageMatch { image_id, new_path, new_thumbnail, full_image, show_preview, preview_w, preview_h, confidence_str, fail_msg, move_mouse, ignore_failure, window_title } => {
+                    EditState::ImageMatch { image_id, new_path, new_thumbnail, full_image, show_preview, preview_w, preview_h, confidence_str, fail_msg, move_mouse, ignore_failure, retry_until_match, window_title } => {
                         if let Some(p) = self.picked_path.take() {
                             *new_path = p.clone();
                             *full_image = std::fs::read(&p).ok();
@@ -572,6 +574,8 @@ impl BeerClickerApp {
                                 });
                                 ui.add_space(2.0);
                                 ui.checkbox(ignore_failure, t(self.lang, "无视失败继续执行", "Ignore failure"));
+                                ui.add_space(2.0);
+                                ui.checkbox(retry_until_match, t(self.lang, "循环重试直到成功", "Retry until matched"));
                             });
                         });
                         }
@@ -681,7 +685,7 @@ impl BeerClickerApp {
                     self.state.tasks[idx].extra = if *is_relative { duration | RELATIVE_FLAG } else { duration };
                     pack_move(x, y)
                 }
-                EditState::ImageMatch { confidence_str, fail_msg, move_mouse, ignore_failure, window_title, new_path, .. } => {
+                EditState::ImageMatch { confidence_str, fail_msg, move_mouse, ignore_failure, retry_until_match, window_title, new_path, .. } => {
                     let conf = confidence_str.parse::<u8>().unwrap_or(85);
                     let old_window_id = self.state.tasks[idx].extra >> 10;
                     crate::config::delete_msg(old_window_id as u64);
@@ -693,6 +697,7 @@ impl BeerClickerApp {
                     let extra = conf as u32
                         | (if *move_mouse { 0x100 } else { 0 })
                         | (if *ignore_failure { 0x200 } else { 0 })
+                        | (if *retry_until_match { 0x10000 } else { 0 })
                         | (window_id << 10);
                     self.state.tasks[idx].extra = extra;
                     let (old_image_id, old_fail_id) = unpack_image_match(self.state.tasks[idx].param);

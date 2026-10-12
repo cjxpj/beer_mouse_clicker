@@ -1,31 +1,73 @@
 use std::mem;
 use std::sync::atomic::{AtomicBool, Ordering};
+use winapi::shared::windef::POINT;
 use winapi::um::winuser::{
     SendInput, INPUT, INPUT_MOUSE, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
-    MOUSEEVENTF_WHEEL,
+    KEYEVENTF_SCANCODE, KEYEVENTF_EXTENDEDKEY, MapVirtualKeyW, MAPVK_VK_TO_VSC_EX,
+    MOUSEEVENTF_WHEEL, MOUSEEVENTF_MOVE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_VIRTUALDESK,
     GetCursorPos, SetCursorPos, GetSystemMetrics,
     SM_CXSCREEN, SM_CYSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
 };
 use winapi::um::wingdi::{CreateCompatibleDC, DeleteDC, GetDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, BI_RGB};
 use winapi::um::winuser::{GetDC, ReleaseDC, GetDesktopWindow};
 
-/// 通过 SendInput 发送鼠标事件
-pub fn send_mouse_input(flags: u32) {
-    let mut input: INPUT = unsafe { mem::zeroed() };
-    input.type_ = INPUT_MOUSE;
+/// 通过 SendInput 发送鼠标按键事件，返回是否注入成功。
+///
+/// 为兼容使用 Raw Input 的游戏（它们不响应 SetCursorPos，且要求按键与移动事件同批到达），
+/// 会在**同一次 SendInput 调用**中先注入一个“移动到当前光标坐标”的绝对移动事件
+/// （使用虚拟桌面坐标，兼容多显示器/负坐标），再注入按键事件。
+pub fn send_mouse_input(flags: u32) -> bool {
+    let mut pt: POINT = unsafe { mem::zeroed() };
+    unsafe { GetCursorPos(&mut pt); }
+
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    // 归一化到 0..65535（虚拟桌面范围）
+    let nx = if vw > 1 { ((pt.x - vx) as i64 * 65535 / (vw as i64 - 1)) as i32 } else { 0 };
+    let ny = if vh > 1 { ((pt.y - vy) as i64 * 65535 / (vh as i64 - 1)) as i32 } else { 0 };
+
+    let mut inputs: [INPUT; 2] = unsafe { [mem::zeroed(), mem::zeroed()] };
+    inputs[0].type_ = INPUT_MOUSE;
+    inputs[1].type_ = INPUT_MOUSE;
     unsafe {
-        input.u.mi_mut().dwFlags = flags;
-        SendInput(1, &mut input, mem::size_of::<INPUT>() as i32);
+        inputs[0].u.mi_mut().dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        inputs[0].u.mi_mut().dx = nx;
+        inputs[0].u.mi_mut().dy = ny;
+        inputs[1].u.mi_mut().dwFlags = flags;
+        SendInput(2, inputs.as_mut_ptr(), mem::size_of::<INPUT>() as i32) == 2
     }
 }
 
-/// 通过 SendInput 发送键盘事件
+/// 通过 SendInput 发送键盘事件。
+///
+/// 优先使用**扫描码**注入（KEYEVENTF_SCANCODE），以兼容 DirectInput / Raw Input 的游戏：
+/// 这类游戏不认只填 wVk 的合成按键。扩展键自动附加 KEYEVENTF_EXTENDEDKEY。
 pub fn send_keyboard_input(vk: i32, down: bool) {
     let mut input: INPUT = unsafe { mem::zeroed() };
     input.type_ = INPUT_KEYBOARD;
     unsafe {
+        // MAPVK_VK_TO_VSC_EX: 低字节为扫描码，高字节 0xE0/0xE1 表示扩展键
+        let sc = MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC_EX) as u32;
+        let code = (sc & 0xFF) as u16;
+        let extended = (sc & 0xE000) != 0;
         input.u.ki_mut().wVk = vk as u16;
-        input.u.ki_mut().dwFlags = if down { 0 } else { KEYEVENTF_KEYUP };
+        if code != 0 {
+            input.u.ki_mut().wScan = code;
+            let mut flags = KEYEVENTF_SCANCODE;
+            if extended { flags |= KEYEVENTF_EXTENDEDKEY; }
+            if !down { flags |= KEYEVENTF_KEYUP; }
+            input.u.ki_mut().dwFlags = flags;
+        } else {
+            // 无法映射扫描码时回退为虚拟键码
+            input.u.ki_mut().dwFlags = if down { 0 } else { KEYEVENTF_KEYUP };
+        }
         SendInput(1, &mut input, mem::size_of::<INPUT>() as i32);
     }
 }
