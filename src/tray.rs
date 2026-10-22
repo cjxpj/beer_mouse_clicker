@@ -2,23 +2,24 @@
 
 use crate::lang::Lang;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::thread;
 
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HWND, POINT, HICON};
 use winapi::um::libloaderapi::GetModuleHandleW;
+use winapi::um::processthreadsapi::GetCurrentProcessId;
 use winapi::um::shellapi::{
     ExtractIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use winapi::um::winuser::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW,
-    LoadIconW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    ShowWindow, TrackPopupMenu, TranslateMessage,
-    HWND_MESSAGE, IDI_APPLICATION, MF_STRING, MSG, SW_SHOW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP,
-    WM_RBUTTONUP, WM_USER, WNDCLASSEXW,
+    DestroyWindow, DispatchMessageW, EnumWindows, GetCursorPos, GetMessageW,
+    GetWindowTextW, GetWindowThreadProcessId, LoadIconW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage,
+    IDI_APPLICATION, MF_STRING, MSG, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WM_USER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 /// 托盘请求主窗口显示（eframe update 中轮询）
@@ -27,27 +28,65 @@ pub static SHOW_REQUEST: AtomicBool = AtomicBool::new(false);
 pub static EXIT_REQUEST: AtomicBool = AtomicBool::new(false);
 
 static TRAY_RUNNING: AtomicBool = AtomicBool::new(false);
+/// 托盘图标是否已成功创建
+static TRAY_READY: AtomicBool = AtomicBool::new(false);
+/// 枚举窗口时暂存本进程主窗口句柄
+static FOUND_HWND: AtomicIsize = AtomicIsize::new(0);
 
 const WM_TRAYICON: u32 = WM_USER + 0x100;
 const TRAY_ID: u32 = 1;
 const MENU_SHOW: u32 = 1;
 const MENU_EXIT: u32 = 2;
+const MAIN_TITLE: &str = "酒要点点";
 
 /// 创建系统托盘图标（仅在尚未运行时创建）
-pub fn ensure_tray() {
-    if TRAY_RUNNING.swap(true, Ordering::SeqCst) {
-        return;
+/// 返回托盘是否可用；不可用时调用方不应把窗口藏起来
+pub fn ensure_tray() -> bool {
+    if TRAY_READY.load(Ordering::SeqCst) {
+        return true;
     }
-    thread::spawn(|| {
-        unsafe { tray_thread(); }
-        TRAY_RUNNING.store(false, Ordering::SeqCst);
-    });
+    if !TRAY_RUNNING.swap(true, Ordering::SeqCst) {
+        thread::spawn(|| {
+            unsafe { tray_thread(); }
+            TRAY_READY.store(false, Ordering::SeqCst);
+            TRAY_RUNNING.store(false, Ordering::SeqCst);
+        });
+    }
+    // 等待图标创建完成（最多约 300ms）
+    for _ in 0..20 {
+        if TRAY_READY.load(Ordering::SeqCst) {
+            return true;
+        }
+        thread::sleep(std::time::Duration::from_millis(15));
+    }
+    TRAY_READY.load(Ordering::SeqCst)
+}
+
+/// 查找本进程的主窗口（避免多实例时打开/退出到别的实例）
+unsafe fn find_main_window() -> HWND {
+    FOUND_HWND.store(0, Ordering::SeqCst);
+    EnumWindows(Some(enum_main_window), 0);
+    FOUND_HWND.load(Ordering::SeqCst) as HWND
+}
+
+unsafe extern "system" fn enum_main_window(hwnd: HWND, _lparam: LPARAM) -> i32 {
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid != GetCurrentProcessId() {
+        return 1;
+    }
+    let mut buf = [0u16; 64];
+    let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+    if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == MAIN_TITLE {
+        FOUND_HWND.store(hwnd as isize, Ordering::SeqCst);
+        return 0;
+    }
+    1
 }
 
 /// 直接 Win32 显示窗口 + 设标志让 eframe 同步状态
 unsafe fn show_main_window() {
-    let title = encode_wide("酒要点点\0");
-    let hwnd = FindWindowW(null(), title.as_ptr());
+    let hwnd = find_main_window();
     if !hwnd.is_null() {
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
@@ -79,19 +118,20 @@ unsafe fn show_context_menu(msg_hwnd: HWND) {
         msg_hwnd,
         null_mut(),
     );
+    // 菜单关闭后必须补一个空消息，否则点击别处菜单不会消失
+    PostMessageW(msg_hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
 
     match cmd as u32 {
         MENU_SHOW => show_main_window(),
         MENU_EXIT => {
-            // 不直接发 WM_CLOSE（会被后台拦截），改为设标志
-            let title = encode_wide("酒要点点\0");
-            let hwnd = FindWindowW(null(), title.as_ptr());
+            // 设退出标志，并给主窗口发 WM_CLOSE 唤醒 UI 线程；后台模式下不会拦截
+            EXIT_REQUEST.store(true, Ordering::SeqCst);
+            let hwnd = find_main_window();
             if !hwnd.is_null() {
                 ShowWindow(hwnd, SW_SHOW);
-                SetForegroundWindow(hwnd);
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
             }
-            EXIT_REQUEST.store(true, Ordering::SeqCst);
             SHOW_REQUEST.store(true, Ordering::SeqCst);
             TRAY_RUNNING.store(false, Ordering::SeqCst);
         }
@@ -120,12 +160,12 @@ unsafe fn tray_thread() {
     RegisterClassExW(&wc);
 
     let hwnd = CreateWindowExW(
-        0,
+        WS_EX_TOOLWINDOW,
         class_name.as_ptr(),
         class_name.as_ptr(),
-        0,
+        WS_POPUP,
         0, 0, 0, 0,
-        HWND_MESSAGE,
+        null_mut(),
         null_mut(),
         hinst,
         null_mut(),
@@ -164,6 +204,7 @@ unsafe fn tray_thread() {
         DestroyWindow(hwnd);
         return;
     }
+    TRAY_READY.store(true, Ordering::SeqCst);
 
     let mut msg: MSG = std::mem::zeroed();
     while TRAY_RUNNING.load(Ordering::SeqCst) {

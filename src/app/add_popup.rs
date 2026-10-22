@@ -398,6 +398,14 @@ impl BeerClickerApp {
                                 if ui.small_button(t(self.lang, "重新录制", "Re-record")).clicked() { *recording = true; }
                             });
                         }
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new(t(self.lang, "虚拟键盘", "Virtual Keyboard"))
+                            .id_salt("vk_board_add")
+                            .show(ui, |ui| {
+                                if virtual_keyboard(ui, vk) {
+                                    *recording = false;
+                                }
+                            });
                         if *action_type == TaskActionType::KeyPress {
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
@@ -828,6 +836,14 @@ impl BeerClickerApp {
                                 }
                             });
                         }
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new(t(self.lang, "虚拟键盘", "Virtual Keyboard"))
+                            .id_salt("vk_board_waitkey_add")
+                            .show(ui, |ui| {
+                                if virtual_keyboard(ui, vk) {
+                                    *recording = false;
+                                }
+                            });
                         ui.add_space(8.0);
                         // 复选框
                         ui.checkbox(terminate, t(self.lang, "按键错误终止任务", "Terminate on wrong key"));

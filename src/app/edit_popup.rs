@@ -345,6 +345,14 @@ impl BeerClickerApp {
                                 if ui.button(t(self.lang, "重新录制", "Re-record")).clicked() { *recording = true; }
                             });
                         }
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new(t(self.lang, "虚拟键盘", "Virtual Keyboard"))
+                            .id_salt("vk_board_waitkey_edit")
+                            .show(ui, |ui| {
+                                if virtual_keyboard(ui, vk) {
+                                    *recording = false;
+                                }
+                            });
                         ui.checkbox(terminate, t(self.lang, "按键错误终止任务", "Terminate on wrong key"));
                         ui.checkbox(popup, t(self.lang, "弹窗提示", "Show popup"));
                     }
@@ -409,6 +417,14 @@ impl BeerClickerApp {
                                 if ui.button(t(self.lang, "重新录制", "Re-record")).clicked() { *recording = true; }
                             });
                         }
+                        ui.add_space(4.0);
+                        egui::CollapsingHeader::new(t(self.lang, "虚拟键盘", "Virtual Keyboard"))
+                            .id_salt("vk_board_edit")
+                            .show(ui, |ui| {
+                                if virtual_keyboard(ui, vk) {
+                                    *recording = false;
+                                }
+                            });
                         if *action_type == TaskActionType::KeyPress {
                             ui.horizontal(|ui| {
                                 ui.label(t(self.lang, "长按 (ms):", "Hold (ms):"));

@@ -101,6 +101,8 @@ pub struct BeerClickerApp {
     /// 热键录制时，鼠标键的“已就绪”标志：先等所有鼠标键松开，再接受下一次按下，
     /// 避免把触发录制的这一次点击误录为热键
     hotkey_mouse_armed: bool,
+    /// 是否展开热键的虚拟键盘
+    hotkey_kb_open: bool,
 }
 
 impl BeerClickerApp {
@@ -110,6 +112,11 @@ impl BeerClickerApp {
         let state = AppState::new();
         // 同步注册表（用户在外部删除了注册表项时恢复）
         crate::config::set_autostart_registry(state.autostart);
+        // 后台模式：启动时就创建托盘图标，避免关闭窗口后找不到恢复/退出入口
+        let background = crate::config::load_background();
+        if background {
+            crate::tray::ensure_tray();
+        }
         Self {
             state,
             selected_task: None,
@@ -123,7 +130,7 @@ impl BeerClickerApp {
             was_primary_down: false,
             hovered_task: None,
             first_frame: true,
-            background: crate::config::load_background(),
+            background,
             show_about: false,
             run_as_admin: crate::config::load_run_as_admin(),
             pending_elevate: false,
@@ -156,6 +163,7 @@ impl BeerClickerApp {
             rec_prev_keys: [0u8; 256],
             rec_key_down: [None; 256],
             hotkey_mouse_armed: false,
+            hotkey_kb_open: false,
         }
     }
 
@@ -492,8 +500,22 @@ impl BeerClickerApp {
                             }
                         }
 
-                        // 描述标签 — 短按选中，长按拖拽
-                        let label_resp = ui.add(egui::Label::new(egui::RichText::new(desc.clone()).size(13.0)).sense(egui::Sense::click()));
+                        // 描述标签 — 短按选中，长按拖拽（窗口变窄时截断，保证右侧按钮可见）
+                        let reserve_w = 100.0;
+                        let desc_w = (ui.available_width() - reserve_w).max(48.0);
+                        let label_resp = ui
+                            .allocate_ui_with_layout(
+                                Vec2::new(desc_w, 20.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(desc.clone()).size(13.0))
+                                            .sense(egui::Sense::click())
+                                            .truncate(),
+                                    )
+                                },
+                            )
+                            .inner;
                         if label_resp.clicked() {
                             self.selected_task = Some(i);
                         }
@@ -608,39 +630,55 @@ impl BeerClickerApp {
         let is_on = self.state.clicking.load(Ordering::SeqCst);
         let count = self.state.total_clicks.load(Ordering::SeqCst);
 
-        ui.horizontal(|ui| {
-            let (status, dot_color) = if is_on {
-                (t(self.lang, "点击..", "Running"), C_GREEN)
-            } else {
-                (t(self.lang, "等待开始", "Idle"), C_SUBTEXT)
-            };
-            let dot_r = 4.0;
-            let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(dot_r * 2.0, dot_r * 2.0), egui::Sense::hover());
-            ui.painter().circle_filled(dot_rect.center(), dot_r, dot_color);
-            ui.label(egui::RichText::new(status).size(13.0).color(dot_color));
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let lang_btn = egui::Button::new(
-                    egui::RichText::new(self.lang.short_label()).size(13.0).color(C_SUBTEXT)
-                ).min_size(Vec2::new(28.0, 22.0)).fill(Color32::TRANSPARENT);
-                if ui.add(lang_btn).clicked() {
-                    self.lang = self.lang.toggle();
-                    self.lang.save_to_global();
-                    crate::config::save_lang(match self.lang { Lang::CN => "cn", Lang::EN => "en" });
-                }
-                ui.add_space(8.0);
-                if ui.button(t(self.lang, "+ 添加任务", "+ Add Task")).clicked() {
-                    self.add_state = AddState::PickType;
-                }
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(format!("{} {}", t(self.lang, "累计", "Total"), count)).size(12.0).color(C_SUBTEXT));
+        if ui.available_width() >= 460.0 {
+            ui.horizontal(|ui| {
+                self.header_status(ui, is_on);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.header_actions(ui, count);
+                });
             });
-        });
+        } else {
+            // 窄窗口：分两行，必要时自动换行
+            ui.horizontal_wrapped(|ui| self.header_status(ui, is_on));
+            ui.horizontal_wrapped(|ui| self.header_actions(ui, count));
+        }
+    }
+
+    /// header 左侧：运行状态圆点 + 文字
+    fn header_status(&self, ui: &mut egui::Ui, is_on: bool) {
+        let (status, dot_color) = if is_on {
+            (t(self.lang, "点击..", "Running"), C_GREEN)
+        } else {
+            (t(self.lang, "等待开始", "Idle"), C_SUBTEXT)
+        };
+        let dot_r = 4.0;
+        let (dot_rect, _) = ui.allocate_exact_size(Vec2::new(dot_r * 2.0, dot_r * 2.0), egui::Sense::hover());
+        ui.painter().circle_filled(dot_rect.center(), dot_r, dot_color);
+        ui.label(egui::RichText::new(status).size(13.0).color(dot_color));
+    }
+
+    /// header 右侧：语言 / 添加任务 / 累计
+    fn header_actions(&mut self, ui: &mut egui::Ui, count: u64) {
+        let lang_btn = egui::Button::new(
+            egui::RichText::new(self.lang.short_label()).size(13.0).color(C_SUBTEXT)
+        ).min_size(Vec2::new(28.0, 22.0)).fill(Color32::TRANSPARENT);
+        if ui.add(lang_btn).clicked() {
+            self.lang = self.lang.toggle();
+            self.lang.save_to_global();
+            crate::config::save_lang(match self.lang { Lang::CN => "cn", Lang::EN => "en" });
+        }
+        ui.add_space(8.0);
+        if ui.button(t(self.lang, "+ 添加任务", "+ Add Task")).clicked() {
+            self.add_state = AddState::PickType;
+        }
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(format!("{} {}", t(self.lang, "累计", "Total"), count)).size(12.0).color(C_SUBTEXT));
     }
 
     /// 控制栏：间隔 / 热键 / 循环 / 锁键 / 锁鼠
     fn draw_control_row(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        // 宽度不足时自动换行，避免控件被裁掉
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(t(self.lang, "间隔", "Interval")).size(12.0).color(C_SUBTEXT));
             let mut secs = self.state.interval_ms as f64 / 1000.0;
             let resp = ui.add(
@@ -667,6 +705,13 @@ impl BeerClickerApp {
             if ui.button(&hotkey_text).clicked() {
                 self.state.hotkey_recording = true;
                 self.hotkey_mouse_armed = false;
+                self.hotkey_kb_open = false;
+            }
+            if ui.small_button(t(self.lang, "虚拟键盘", "VKB"))
+                .on_hover_text(t(self.lang, "点击虚拟键盘选择热键", "Pick hotkey from on-screen keyboard"))
+                .clicked()
+            {
+                self.hotkey_kb_open = !self.hotkey_kb_open;
             }
 
             let (rec_text, rec_color) = if self.recording {
@@ -754,6 +799,20 @@ impl BeerClickerApp {
                 crate::config::save_auto_exec_boot(auto_exec_boot);
             }
         });
+
+        // 热键虚拟键盘：点选一个键即设为热键（窗口过窄时可横向滚动）
+        if self.hotkey_kb_open {
+            ui.add_space(4.0);
+            let mut vk = self.state.hotkey;
+            let picked = egui::ScrollArea::horizontal()
+                .id_salt("hotkey_vk_scroll")
+                .show(ui, |ui| virtual_keyboard(ui, &mut vk))
+                .inner;
+            if picked {
+                self.set_hotkey(vk);
+                self.hotkey_kb_open = false;
+            }
+        }
     }
 
     /// 中央主区域：任务列表铺满
@@ -791,51 +850,69 @@ impl BeerClickerApp {
         );
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
-            if ui.button(t(self.lang, "📋 复制", "📋 Copy")).clicked() {
-                if let Some(i) = self.selected_task {
-                    if i < self.state.tasks.len() {
-                        let clone = self.state.tasks[i];
-                        self.state.tasks.insert(i + 1, clone);
-                        crate::config::save_tasks(&self.state.tasks);
-                    }
-                }
-            }
-            if ui.button(t(self.lang, "X 清空", "X Clear")).clicked() {
-                for t in &self.state.tasks {
-                    Self::cleanup_task_db(t);
-                }
-                self.state.tasks.clear();
-                crate::config::save_tasks(&self.state.tasks);
-                self.selected_task = None;
-            }
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(t(self.lang, "关于", "About")).clicked() {
-                    self.show_about = true;
-                }
-                ui.add_space(8.0);
-                if ui.checkbox(&mut self.background, t(self.lang, "后台", "Tray")).changed() {
-                    crate::config::save_background(self.background);
-                }
-                ui.add_space(8.0);
-                let mut autostart = self.state.autostart;
-                if ui.checkbox(&mut autostart, t(self.lang, "开机自启", "Auto Start"))
-                    .on_hover_text(t(self.lang,
-                        "Windows启动时自动运行本程序",
-                        "Launch this app when Windows starts"))
-                    .changed()
-                {
-                    self.state.autostart = autostart;
-                    crate::config::save_autostart(autostart);
-                    crate::config::set_autostart_registry(autostart);
-                }
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.show_coords, t(self.lang, "监控坐标", "Coords"));
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new(format!("{} {}", self.state.tasks.len(), t(self.lang, "个任务", "tasks"))).size(13.0).color(C_SUBTEXT));
+        if ui.available_width() >= 660.0 {
+            ui.horizontal(|ui| {
+                self.footer_actions(ui);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.footer_settings(ui);
+                });
             });
-        });
+        } else {
+            // 窄窗口：分两行，必要时自动换行
+            ui.horizontal_wrapped(|ui| self.footer_actions(ui));
+            ui.horizontal_wrapped(|ui| self.footer_settings(ui));
+        }
+    }
+
+    /// footer 左侧：复制 / 清空
+    fn footer_actions(&mut self, ui: &mut egui::Ui) {
+        if ui.button(t(self.lang, "📋 复制", "📋 Copy")).clicked() {
+            if let Some(i) = self.selected_task {
+                if i < self.state.tasks.len() {
+                    let clone = self.state.tasks[i];
+                    self.state.tasks.insert(i + 1, clone);
+                    crate::config::save_tasks(&self.state.tasks);
+                }
+            }
+        }
+        if ui.button(t(self.lang, "X 清空", "X Clear")).clicked() {
+            for t in &self.state.tasks {
+                Self::cleanup_task_db(t);
+            }
+            self.state.tasks.clear();
+            crate::config::save_tasks(&self.state.tasks);
+            self.selected_task = None;
+        }
+    }
+
+    /// footer 右侧：关于 / 后台 / 自启 / 坐标 / 任务数
+    fn footer_settings(&mut self, ui: &mut egui::Ui) {
+        if ui.button(t(self.lang, "关于", "About")).clicked() {
+            self.show_about = true;
+        }
+        ui.add_space(8.0);
+        if ui.checkbox(&mut self.background, t(self.lang, "后台", "Tray")).changed() {
+            crate::config::save_background(self.background);
+            if self.background {
+                crate::tray::ensure_tray();
+            }
+        }
+        ui.add_space(8.0);
+        let mut autostart = self.state.autostart;
+        if ui.checkbox(&mut autostart, t(self.lang, "开机自启", "Auto Start"))
+            .on_hover_text(t(self.lang,
+                "Windows启动时自动运行本程序",
+                "Launch this app when Windows starts"))
+            .changed()
+        {
+            self.state.autostart = autostart;
+            crate::config::save_autostart(autostart);
+            crate::config::set_autostart_registry(autostart);
+        }
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.show_coords, t(self.lang, "监控坐标", "Coords"));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(format!("{} {}", self.state.tasks.len(), t(self.lang, "个任务", "tasks"))).size(13.0).color(C_SUBTEXT));
     }
 
     fn draw_about_popup(&mut self, ctx: &egui::Context) {
@@ -893,10 +970,13 @@ impl eframe::App for BeerClickerApp {
         }
 
         // 后台模式：关闭窗口时缩到系统托盘
-        if ctx.input(|i| i.viewport().close_requested()) && self.background {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            crate::tray::ensure_tray();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // 若正在退出，或托盘图标创建失败，则不拦截关闭，避免窗口藏起来后无法恢复
+        let exiting = crate::tray::EXIT_REQUEST.load(Ordering::SeqCst);
+        if ctx.input(|i| i.viewport().close_requested()) && self.background && !exiting {
+            if crate::tray::ensure_tray() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
         }
 
         // 托盘请求恢复窗口
@@ -906,7 +986,9 @@ impl eframe::App for BeerClickerApp {
         // 托盘请求退出程序
         if crate::tray::EXIT_REQUEST.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.background = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
         }
 
         self.process_hotkey_recording(ctx);

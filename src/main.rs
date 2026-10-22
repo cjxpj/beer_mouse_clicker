@@ -26,6 +26,8 @@ fn main() {
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([WND_W as f32, WND_H as f32])
+        // 允许缩小窗口，布局会自动换行；限制最小尺寸避免控件完全挤在一起
+        .with_min_inner_size([420.0, 320.0])
         .with_title("酒要点点");
     if let Some(icon) = icon_data {
         viewport = viewport.with_icon(icon);
